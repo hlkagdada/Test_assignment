@@ -1,236 +1,283 @@
+import json
 import os
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-# PATHS
 DATA_CSV = "/app/data/DFT_ENERGY_STRAINS.csv"
 POSCAR_PATH = "/app/data/POSCAR_UNITCELL"
 OUTPUT_DIR = "/app/output"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+EV_TO_JOULE = 1.602176634e-19
+ANG3_TO_M3 = 1.0e-30
+AMU_TO_KG = 1.66053906660e-27
+GPA_TO_PA = 1.0e9
 
-# ==============================================================================
-# STAGE 1: PARSING AND PREPARATION OF THE DATA (Steps 1–5)
-# ==============================================================================
+ATOMIC_MASSES = {
+    "H": 1.008, "He": 4.002602,
+    "Li": 6.94, "Be": 9.0121831, "B": 10.81, "C": 12.011,
+    "N": 14.007, "O": 15.999, "F": 18.998403163, "Ne": 20.1797,
+    "Na": 22.98976928, "Mg": 24.305, "Al": 26.9815385, "Si": 28.085,
+    "P": 30.973761998, "S": 32.06, "Cl": 35.45, "Ar": 39.948,
+    "K": 39.0983, "Ca": 40.078, "Sc": 44.955908, "Ti": 47.867,
+    "V": 50.9415, "Cr": 51.9961, "Mn": 54.938044, "Fe": 55.845,
+    "Co": 58.933194, "Ni": 58.6934, "Cu": 63.546, "Zn": 65.38,
+    "Ga": 69.723, "Ge": 72.630, "As": 74.921595, "Se": 78.971,
+    "Br": 79.904, "Kr": 83.798,
+    "Rb": 85.4678, "Sr": 87.62, "Y": 88.90584, "Zr": 91.224,
+    "Nb": 92.90637, "Mo": 95.95, "Tc": 98.0, "Ru": 101.07,
+    "Rh": 102.90550, "Pd": 106.42, "Ag": 107.8682, "Cd": 112.414,
+    "In": 114.818, "Sn": 118.710, "Sb": 121.760, "Te": 127.60,
+    "I": 126.90447, "Xe": 131.293,
+    "Cs": 132.90545196, "Ba": 137.327, "La": 138.90547, "Ce": 140.116,
+    "Pr": 140.90766, "Nd": 144.242, "Pm": 145.0, "Sm": 150.36,
+    "Eu": 151.964, "Gd": 157.25, "Tb": 158.92535, "Dy": 162.500,
+    "Ho": 164.93033, "Er": 167.259, "Tm": 168.93422, "Yb": 173.045,
+    "Lu": 174.9668, "Hf": 178.49, "Ta": 180.94788, "W": 183.84,
+    "Re": 186.207, "Os": 190.23, "Ir": 192.217, "Pt": 195.084,
+    "Au": 196.966569, "Hg": 200.592, "Tl": 204.38, "Pb": 207.2,
+    "Bi": 208.98040, "Po": 209.0, "At": 210.0, "Rn": 222.0,
+    "Fr": 223.0, "Ra": 226.0, "Ac": 227.0, "Th": 232.0377,
+    "Pa": 231.03588, "U": 238.02891,
+}
 
-def step_01_read_poscar(poscar_path):
-    """Step 1: Read POSCAR lines."""
-    with open(poscar_path, 'r') as f:
-        return [line.strip() for line in f.readlines()]
 
-def step_02_extract_lattice_vectors(poscar_lines):
-    """Step 2: Parse 3x3 lattice vectors and scale factor."""
-    scale = float(poscar_lines[1])
-    vecs = np.array([[float(x) for x in poscar_lines[i].split()] for i in range(2, 5)])
-    return scale * vecs
+def read_poscar(path):
+    with open(path, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
 
-def step_03_calculate_unit_cell_volume(lattice_matrix):
-    """Step 3: Calculate unit cell volume V0 in Angstrom^3."""
-    v0 = float(np.abs(np.dot(lattice_matrix[0], np.cross(lattice_matrix[1], lattice_matrix[2]))))
-    assert v0 > 0, "Volume must be positive."
-    return v0
+    scale = float(lines[1])
+    lattice = np.array([[float(x) for x in lines[i].split()[:3]] for i in range(2, 5)])
 
-def step_04_load_dft_dataset(csv_path):
-    """Step 4: Load energy vs. strain CSV data."""
-    df = pd.read_csv(csv_path)
-    required = {'distortion_type', 'strain', 'energy_ev'}
-    assert required.issubset(df.columns), f"CSV missing required columns: {required - set(df.columns)}"
+    # VASP permits a negative scale to specify a target volume. The supplied
+    # task uses a positive scale, but handle the standard case explicitly.
+    if scale > 0:
+        lattice = scale * lattice
+    elif scale < 0:
+        target_volume = abs(scale)
+        raw_volume = abs(np.linalg.det(lattice))
+        lattice = lattice * (target_volume / raw_volume) ** (1.0 / 3.0)
+    else:
+        raise ValueError("POSCAR scale factor cannot be zero.")
+
+    species = lines[5].split()
+    counts = [int(x) for x in lines[6].split()]
+    if len(species) != len(counts):
+        raise ValueError("POSCAR species/count entries are inconsistent.")
+
+    return lines, lattice, species, counts
+
+
+def unit_cell_volume(lattice):
+    return float(abs(np.linalg.det(lattice)))
+
+
+def mass_density(species, counts, volume_a3):
+    try:
+        total_mass_amu = sum(
+            ATOMIC_MASSES[element] * count
+            for element, count in zip(species, counts)
+        )
+    except KeyError as exc:
+        raise ValueError(f"No atomic mass available for element {exc.args[0]}.")
+
+    return total_mass_amu * AMU_TO_KG / (volume_a3 * ANG3_TO_M3)
+
+
+def load_dft_dataset(path):
+    df = pd.read_csv(path)
+    required = {"strain_pattern", "eta", "energy_ev"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV missing required columns: {sorted(missing)}")
+    expected = {"e1", "e2", "e3", "e4", "e5", "e6", "e1_e2", "e1_e3", "e2_e3"}
+    found = set(df["strain_pattern"])
+    missing_patterns = expected - found
+    if missing_patterns:
+        raise ValueError(f"CSV missing strain patterns: {sorted(missing_patterns)}")
     return df
 
-def step_05_convert_units_ev_to_gpa(v0_ang3):
-    """Step 5: Compute conversion factor from eV/Angstrom^3 to GPa."""
-    EV_TO_JOULE = 1.602176634e-19
-    ANG3_TO_M3 = 1e-30
-    GPA_CONVERSION = (EV_TO_JOULE / ANG3_TO_M3) / 1e9
-    return GPA_CONVERSION / v0_ang3
 
-# ==============================================================================
-# STAGE 2: STRAIN-ENERGY POLYNOMIAL FITTING (Steps 6–10)
-# ==============================================================================
+def fit_curvatures(df):
+    curvatures = {}
+    coefficients = {}
+    for pattern, group in df.groupby("strain_pattern"):
+        x = group["eta"].to_numpy(dtype=float)
+        y = group["energy_ev"].to_numpy(dtype=float)
+        if len(x) < 5:
+            raise ValueError(f"Need at least five points for a fourth-order fit: {pattern}")
+        coeff = np.polyfit(x, y, 4)
+        coefficients[pattern] = coeff.tolist()
+        # np.polyfit returns [a4, a3, a2, a1, a0].
+        curvatures[pattern] = float(2.0 * coeff[2])
+    return curvatures, coefficients
 
-def step_06_filter_distortion_data(df, distortion_name):
-    """Step 6: Extract subset dataframe for specific distortion pattern."""
-    sub_df = df[df['distortion_type'] == distortion_name].sort_values('strain')
-    assert len(sub_df) >= 3, f"Insufficient data points for {distortion_name}"
-    return sub_df['strain'].values, sub_df['energy_ev'].values
 
-def step_07_fit_quadratic_energy(strains, energies):
-    """Step 7: Fit E(delta) = E0 + A*delta + B*delta^2 and extract curvature 2B."""
-    coeffs = np.polyfit(strains, energies, 2)
-    curvature = 2.0 * coeffs[0]  # Second derivative d^2E/d(delta)^2
-    return curvature
+def build_orthorhombic_cij(curvatures, volume_a3):
+    # E(eta) curvature is in eV. For E = E0 + 1/2*V*C*eta^2,
+    # C[GPa] = curvature[eV] * (eV/Ang^3 -> GPa) / V[Ang^3].
+    ev_per_a3_to_gpa = (EV_TO_JOULE / ANG3_TO_M3) / GPA_TO_PA
+    factor = ev_per_a3_to_gpa / volume_a3
 
-def step_08_extract_c11_plus_c12_curvature(df):
-    """Step 8: Compute 2nd derivative for hydrostatic/triaxial strain mode."""
-    strains, energies = step_06_filter_distortion_data(df, 'hydrostatic')
-    return step_07_fit_quadratic_energy(strains, energies)
+    c11 = curvatures["e1"] * factor
+    c22 = curvatures["e2"] * factor
+    c33 = curvatures["e3"] * factor
+    c44 = curvatures["e4"] * factor
+    c55 = curvatures["e5"] * factor
+    c66 = curvatures["e6"] * factor
 
-def step_09_extract_c11_minus_c12_curvature(df):
-    """Step 9: Compute 2nd derivative for volume-conserving orthorhombic strain mode."""
-    strains, energies = step_06_filter_distortion_data(df, 'orthorhombic')
-    return step_07_fit_quadratic_energy(strains, energies)
+    c12 = 0.5 * (
+        curvatures["e1_e2"] - curvatures["e1"] - curvatures["e2"]
+    ) * factor
+    c13 = 0.5 * (
+        curvatures["e1_e3"] - curvatures["e1"] - curvatures["e3"]
+    ) * factor
+    c23 = 0.5 * (
+        curvatures["e2_e3"] - curvatures["e2"] - curvatures["e3"]
+    ) * factor
 
-def step_10_extract_c44_curvature(df):
-    """Step 10: Compute 2nd derivative for monoclinic shear strain mode."""
-    strains, energies = step_06_filter_distortion_data(df, 'shear')
-    return step_07_fit_quadratic_energy(strains, energies)
-
-# ==============================================================================
-# STAGE 3: ELASTIC STIFFNESS MATRIX ASSEMBLY & STABILITY (Steps 11–15)
-# ==============================================================================
-
-def step_11_compute_raw_elastic_constants(curv_c11_c12, curv_c11_sub_c12, curv_c44, conv_factor):
-    """Step 11: Convert second derivatives to GPa elastic constants C11, C12, C44."""
-    # Example scaling for cubic symmetry
-    c11_plus_c12 = curv_c11_c12 * conv_factor
-    c11_minus_c12 = curv_c11_sub_c12 * conv_factor
-    
-    c11 = 0.5 * (c11_plus_c12 + c11_minus_c12)
-    c12 = 0.5 * (c11_plus_c12 - c11_minus_c12)
-    c44 = curv_c44 * conv_factor
-    return c11, c12, c44
-
-def step_12_assemble_cubic_cij_matrix(c11, c12, c44):
-    """Step 12: Build 6x6 Voigt stiffness matrix C_ij."""
-    C = np.zeros((6, 6))
-    C[0,0] = C[1,1] = C[2,2] = c11
-    C[0,1] = C[0,2] = C[1,0] = C[1,2] = C[2,0] = C[2,1] = c12
-    C[3,3] = C[4,4] = C[5,5] = c44
+    C = np.array([
+        [c11, c12, c13, 0.0, 0.0, 0.0],
+        [c12, c22, c23, 0.0, 0.0, 0.0],
+        [c13, c23, c33, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, c44, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, c55, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, c66],
+    ])
     return C
 
-def step_13_verify_matrix_symmetry(C_matrix):
-    """Step 13: Assert C_ij matrix is symmetric."""
-    assert np.allclose(C_matrix, C_matrix.T, atol=1e-5), "Elastic matrix C_ij is not symmetric!"
-    return True
 
-def step_14_check_born_stability_criteria(c11, c12, c44):
-    """Step 14: Check Born mechanical stability conditions for cubic systems."""
-    cond1 = c11 - c12 > 0
-    cond2 = c11 + 2 * c12 > 0
-    cond3 = c44 > 0
-    assert cond1 and cond2 and cond3, f"Born stability failed: C11-C12={c11-c12}, C11+2C12={c11+2*c12}, C44={c44}"
-    return True
+def check_stability(C):
+    eigenvalues = np.linalg.eigvalsh(C)
+    if np.min(eigenvalues) <= 0:
+        raise ValueError(
+            f"Elastic stiffness matrix is not positive definite. "
+            f"Minimum eigenvalue = {np.min(eigenvalues):.8g} GPa."
+        )
+    return eigenvalues
 
-def step_15_compute_compliance_matrix(C_matrix):
-    """Step 15: Invert stiffness matrix C_ij to obtain compliance matrix S_ij."""
-    S = np.linalg.inv(C_matrix)
-    return S
 
-# ==============================================================================
-# STAGE 4: ELASTIC MODULUS (Steps 16–20)
-# ==============================================================================
+def vrh_properties(C):
+    S = np.linalg.inv(C)
 
-def step_16_compute_voigt_bulk_modulus(c11, c12):
-    """Step 16: Compute Voigt upper bound for Bulk Modulus K_V."""
-    return (c11 + 2 * c12) / 3.0
+    c11, c22, c33 = C[0, 0], C[1, 1], C[2, 2]
+    c12, c13, c23 = C[0, 1], C[0, 2], C[1, 2]
+    c44, c55, c66 = C[3, 3], C[4, 4], C[5, 5]
 
-def step_17_compute_reuss_bulk_modulus(S_matrix):
-    """Step 17: Compute Reuss lower bound for Bulk Modulus K_R."""
-    s11, s12 = S_matrix[0,0], S_matrix[0,1]
-    return 1.0 / (3.0 * (s11 + 2 * s12))
+    b_v = (
+        c11 + c22 + c33
+        + 2.0 * (c12 + c13 + c23)
+    ) / 9.0
 
-def step_18_compute_voigt_shear_modulus(c11, c12, c44):
-    """Step 18: Compute Voigt upper bound for Shear Modulus G_V."""
-    return (c11 - c12 + 3 * c44) / 5.0
+    g_v = (
+        c11 + c22 + c33
+        - c12 - c13 - c23
+        + 3.0 * (c44 + c55 + c66)
+    ) / 15.0
 
-def step_19_compute_reuss_shear_modulus(S_matrix):
-    """Step 19: Compute Reuss lower bound for Shear Modulus G_R."""
-    s11, s12, s44 = S_matrix[0,0], S_matrix[0,1], S_matrix[3,3]
-    return 5.0 / (4.0 * (s11 - s12) + 3.0 * s44)
+    b_r = 1.0 / (
+        S[0, 0] + S[1, 1] + S[2, 2]
+        + 2.0 * (S[0, 1] + S[0, 2] + S[1, 2])
+    )
 
-def step_20_compute_vrh_averages(k_v, k_r, g_v, g_r):
-    """Step 20: Compute Hill average for Bulk (K_VRH) and Shear (G_VRH) moduli."""
-    k_vrh = 0.5 * (k_v + k_r)
+    g_r = 15.0 / (
+        4.0 * (S[0, 0] + S[1, 1] + S[2, 2])
+        - 4.0 * (S[0, 1] + S[0, 2] + S[1, 2])
+        + 3.0 * (S[3, 3] + S[4, 4] + S[5, 5])
+    )
+
+    b_vrh = 0.5 * (b_v + b_r)
     g_vrh = 0.5 * (g_v + g_r)
-    return k_vrh, g_vrh
+    nu = (3.0 * b_vrh - 2.0 * g_vrh) / (
+        2.0 * (3.0 * b_vrh + g_vrh)
+    )
+    anisotropy_au = 5.0 * g_v / g_r + b_v / b_r - 6.0
 
-# ==============================================================================
-# STAGE 5: SOUND VELOCITIES & DEBYE TEMPERATURE CALCULATIONS (Steps 21–25)
-# ==============================================================================
-
-def step_21_calculate_mass_density(poscar_lines, v0_ang3):
-    """Step 21: Extract atomic masses and calculate mass density rho (kg/m^3)."""
-    # Example placeholder mass calculation for target material
-    total_mass_amu = 55.845 * 2  # e.g., 2 Fe atoms
-    AMU_TO_KG = 1.66053906660e-27
-    ANG3_TO_M3 = 1e-30
-    rho = (total_mass_amu * AMU_TO_KG) / (v0_ang3 * ANG3_TO_M3)
-    return rho
-
-def step_22_compute_longitudinal_sound_velocity(k_vrh, g_vrh, rho):
-    """Step 22: Compute longitudinal sound velocity v_l (m/s)."""
-    # Convert GPa to Pa
-    modulus_pa = (k_vrh + (4.0 / 3.0) * g_vrh) * 1e9
-    vl = np.sqrt(modulus_pa / rho)
-    return vl
-
-def step_23_compute_transverse_sound_velocity(g_vrh, rho):
-    """Step 23: Compute transverse sound velocity v_t (m/s)."""
-    g_pa = g_vrh * 1e9
-    vt = np.sqrt(g_pa / rho)
-    return vt
-
-def step_24_compute_average_sound_velocity(vl, vt):
-    """Step 24: Compute average sound velocity v_m (m/s)."""
-    v_m = ( (1.0 / 3.0) * ( (1.0 / (vl**3)) + (2.0 / (vt**3)) ) ) ** (-1.0 / 3.0)
-    return v_m
-
-def step_25_calculate_debye_temperature(v_m, v0_ang3, num_atoms=2, k_vrh=0.0, g_vrh=0.0):
-    """Step 25: Calculate Debye Temperature Theta_D (K) and save final results."""
-    H_PLANCK = 6.62607015e-34
-    K_BOLTZMANN = 1.380649e-23
-    
-    v0_m3 = v0_ang3 * 1e-30
-    number_density = num_atoms / v0_m3
-    
-    theta_d = (H_PLANCK / K_BOLTZMANN) * v_m * ((3.0 * number_density) / (4.0 * np.pi))**(1.0 / 3.0)
-    
-    # Save output artifacts
-    output_path = os.path.join(OUTPUT_DIR, "elastic_properties.csv")
-    results = pd.DataFrame([{
-        "debye_temperature_K": theta_d,
-        "average_sound_velocity_m_s": v_m,
-        "bulk_modulus_vrh_GPa": k_vrh,
-        "shear_modulus_vrh_GPa": g_vrh
-    }])
-    results.to_csv(output_path, index=False)
-    return theta_d
+    return {
+        "S_ij": S,
+        "B_V": b_v,
+        "B_R": b_r,
+        "B_VRH": b_vrh,
+        "G_V": g_v,
+        "G_R": g_r,
+        "G_VRH": g_vrh,
+        "nu_VRH": nu,
+        "Anisotropy_AU": anisotropy_au,
+    }
 
 
-# ==============================================================================
-# PIPELINE EXECUTION COMMANDS
-# ==============================================================================
+def acoustic_properties(b_vrh, g_vrh, rho, volume_a3, num_atoms):
+    vl = np.sqrt((b_vrh + (4.0 / 3.0) * g_vrh) * GPA_TO_PA / rho)
+    vt = np.sqrt(g_vrh * GPA_TO_PA / rho)
+    vm = (
+        (1.0 / 3.0) * (1.0 / vl**3 + 2.0 / vt**3)
+    ) ** (-1.0 / 3.0)
+
+    number_density = num_atoms / (volume_a3 * ANG3_TO_M3)
+    theta_d = (
+        (6.62607015e-34 / 1.380649e-23)
+        * vm
+        * ((3.0 * number_density) / (4.0 * np.pi)) ** (1.0 / 3.0)
+    )
+
+    return {
+        "v_l": float(vl),
+        "v_t": float(vt),
+        "v_m": float(vm),
+        "Debye_temperature": float(theta_d),
+    }
+
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    _, lattice, species, counts = read_poscar(POSCAR_PATH)
+    volume_a3 = unit_cell_volume(lattice)
+    rho = mass_density(species, counts, volume_a3)
+    df = load_dft_dataset(DATA_CSV)
+
+    curvatures, coefficients = fit_curvatures(df)
+    C = build_orthorhombic_cij(curvatures, volume_a3)
+    eigenvalues = check_stability(C)
+    props = vrh_properties(C)
+    acoustic = acoustic_properties(
+        props["B_VRH"],
+        props["G_VRH"],
+        rho,
+        volume_a3,
+        sum(counts),
+    )
+
+    result = {
+        "V0_A3": volume_a3,
+        "density_kg_m3": rho,
+        "C_ij": C.tolist(),
+        "S_ij": props["S_ij"].tolist(),
+        "B_V": props["B_V"],
+        "B_R": props["B_R"],
+        "B_VRH": props["B_VRH"],
+        "G_V": props["G_V"],
+        "G_R": props["G_R"],
+        "G_VRH": props["G_VRH"],
+        "nu_VRH": props["nu_VRH"],
+        "Anisotropy_AU": props["Anisotropy_AU"],
+        "v_l": acoustic["v_l"],
+        "v_t": acoustic["v_t"],
+        "v_m": acoustic["v_m"],
+        "Debye_temperature": acoustic["Debye_temperature"],
+        "fit_curvatures_eV": curvatures,
+        "fit_coefficients": coefficients,
+        "C_eigenvalues_GPa": eigenvalues.tolist(),
+        "num_atoms": int(sum(counts)),
+    }
+
+    output_path = os.path.join(OUTPUT_DIR, "elastic_properties.json")
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+
+    print(json.dumps(result, indent=2))
+
 
 if __name__ == "__main__":
-    # Stage 1
-    lines = step_01_read_poscar(POSCAR_PATH)
-    lat_mat = step_02_extract_lattice_vectors(lines)
-    v0 = step_03_calculate_unit_cell_volume(lat_mat)
-    df_dft = step_04_load_dft_dataset(DATA_CSV)
-    conv_factor = step_05_convert_units_ev_to_gpa(v0)
-
-    # Stage 2
-    curv_11_12 = step_08_extract_c11_plus_c12_curvature(df_dft)
-    curv_11_sub_12 = step_09_extract_c11_minus_c12_curvature(df_dft)
-    curv_44 = step_10_extract_c44_curvature(df_dft)
-
-    # Stage 3
-    c11, c12, c44 = step_11_compute_raw_elastic_constants(curv_11_12, curv_11_sub_12, curv_44, conv_factor)
-    C_mat = step_12_assemble_cubic_cij_matrix(c11, c12, c44)
-    step_13_verify_matrix_symmetry(C_mat)
-    step_14_check_born_stability_criteria(c11, c12, c44)
-    S_mat = step_15_compute_compliance_matrix(C_mat)
-
-    # Stage 4
-    kV = step_16_compute_voigt_bulk_modulus(c11, c12)
-    kR = step_17_compute_reuss_bulk_modulus(S_mat)
-    gV = step_18_compute_voigt_shear_modulus(c11, c12, c44)
-    gR = step_19_compute_reuss_shear_modulus(S_mat)
-    k_vrh, g_vrh = step_20_compute_vrh_averages(kV, kR, gV, gR)
-
-    # Stage 5
-    rho = step_21_calculate_mass_density(lines, v0)
-    vl = step_22_compute_longitudinal_sound_velocity(k_vrh, g_vrh, rho)
-    vt = step_23_compute_transverse_sound_velocity(g_vrh, rho)
-    vm = step_24_compute_average_sound_velocity(vl, vt)
-    theta_d = step_25_calculate_debye_temperature(vm, v0)
+    main()

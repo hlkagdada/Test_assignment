@@ -37,27 +37,3 @@ Save all output parameters in JSON format to `/app/output/elastic_properties.jso
   "Debye_temperature": 0.0
 }
 
----
-
-### Environment Setup
-
-#### `tasks/physics/condensed-matter/first-principles-elasticity-polycrystal/environment/Dockerfile`
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir \
-    numpy \
-    scipy \
-    pandas \
-    pytest
-
-COPY environment/data/ /app/data/
-RUN mkdir -p /app/output /app/tests /app/solution
-
-CMD ["bash"]

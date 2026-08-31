@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-python3 /app/solution/elastic_pipeline.py
-python3 /app/solution/run_pipeline_summary.py
+python3 /solution/elastic_pipeline.py
+python3 /solution/run_pipeline_summary.py

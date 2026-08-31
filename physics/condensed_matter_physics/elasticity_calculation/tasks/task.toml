@@ -1,14 +1,29 @@
+schema_version = "1.4"
+artifacts = ["/app/output/elastic_properties.json"]
 [task]
-name = "elasticity_calculation"
+name = "hardik/elasticity-calculation"
 version = "1.0.0"
-difficulty = "hard"
-tags = ["physics", "condensed-matter", "dft", "elasticity"]
+description = "Calculate elastic properties of a crystalline material from DFT strain-energy data."
+authors = []
+keywords = ["physics", "condensed-matter", "dft", "elasticity"]
+
+[metadata]
+
+[verifier]
+timeout_sec = 1200.0
+collect = []
+
+[verifier.env]
+
+[agent]
+timeout_sec = 1200.0
 
 [environment]
-dockerfile = "environment/Dockerfile"
+network_mode = "public"
+build_timeout_sec = 1200.0
+os = "linux"
+mcp_servers = []
 
-[solution]
-entrypoint = "python /app/solution/run_pipeline_summary.py"
+[environment.env]
 
-[tests]
-entrypoint = "pytest /app/tests/elasticity_test.py"
+[solution.env]

@@ -12,11 +12,7 @@ RUN pip install --no-cache-dir \
     pandas \
     pytest
 
-# Copy data, solution scripts, and test suite
-COPY environment/Data/ /app/data/
-COPY solution/ /app/solution/
-COPY tests/ /app/tests/
+# Copy task data available inside the Docker build context
+COPY Data/ /app/data/
 
 RUN mkdir -p /app/output
-
-CMD ["bash"]

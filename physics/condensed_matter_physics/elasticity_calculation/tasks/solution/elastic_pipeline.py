@@ -50,8 +50,7 @@ def read_poscar(path):
     scale = float(lines[1])
     lattice = np.array([[float(x) for x in lines[i].split()[:3]] for i in range(2, 5)])
 
-    # VASP permits a negative scale to specify a target volume. The supplied
-    # task uses a positive scale, but handle the standard case explicitly.
+    #in some of DFT codes such as vasp gives negative scale
     if scale > 0:
         lattice = scale * lattice
     elif scale < 0:

@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir \
     pytest
 
 # Copy data, solution scripts, and test suite
-COPY environment/Data/ /app/data/
+COPY environment/data/ /app/data/
 COPY solution/ /app/solution/
 COPY tests/ /app/tests/
 

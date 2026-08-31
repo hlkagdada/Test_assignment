@@ -1,0 +1,14 @@
+[task]
+name = "elasticity_calculation"
+version = "1.0.0"
+difficulty = "hard"
+tags = ["physics", "condensed-matter", "dft", "elasticity"]
+
+[environment]
+dockerfile = "environment/Dockerfile"
+
+[solution]
+entrypoint = "python /app/solution/run_pipeline_summary.py"
+
+[tests]
+entrypoint = "pytest /app/tests/elasticity_test.py"
